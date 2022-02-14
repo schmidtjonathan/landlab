@@ -405,18 +405,7 @@ class LinearDiffuser(Component):
                 self._hoz_link_neighbors == -1,
             )
 
-    def run_one_step(self, dt):
-        """Run the diffuser for one timestep, dt.
-
-        If the imposed timestep dt is longer than the Courant-Friedrichs-Lewy
-        condition for the diffusion, this timestep will be internally divided
-        as the component runs, as needed.
-
-        Parameters
-        ----------
-        dt : float (time)
-            The imposed timestep.
-        """
+    def discretize_rhs(self):
         mg = self._grid
         z = self._grid.at_node[self._values_to_diffuse]
 
@@ -427,7 +416,6 @@ class LinearDiffuser(Component):
             self.updated_boundary_conditions()
             self._bc_set_code = self._grid.bc_set_code
 
-        core_nodes = self._grid.node_at_core_cell
         # do mapping of array kd here, in case it points at an updating
         # field:
         if isinstance(self._kd, np.ndarray):
@@ -455,119 +443,118 @@ class LinearDiffuser(Component):
             kd_links = kd_links.copy()
             kd_links[self._grid.status_at_link == LinkStatus.INACTIVE] = 0.0
 
+        if not self._use_diags:
+            grads = mg.calc_grad_at_link(z)
+            self._g[mg.active_links] = grads[mg.active_links]
+            if not self._use_patches:  # currently forbidden
+                # if diffusivity is an array, self._kd is already
+                # active_links-long
+                self._qs[mg.active_links] = -kd_activelinks * self._g[mg.active_links]
+                # Calculate the net deposition/erosion rate at each node
+                mg.calc_flux_div_at_node(self._qs, out=self._dqsds)
+            else:  # project onto patches
+                slx = mg.zeros("link")
+                sly = mg.zeros("link")
+                slx[self._hoz] = self._g[self._hoz]
+                sly[self._vert] = self._g[self._vert]
+                patch_dx, patch_dy = mg.calc_grad_at_patch(z)
+                xvecs_vert = np.ma.array(
+                    patch_dx[self._y_link_patches], mask=self._y_link_patch_mask
+                )
+                slx[self._vert] = xvecs_vert.mean()
+                yvecs_hoz = np.ma.array(
+                    patch_dy[self._x_link_patches], mask=self._x_link_patch_mask
+                )
+                sly[self._hoz] = yvecs_hoz.mean()
+                # now map diffusivities (already on links, but we want
+                # more spatial averaging)
+                Kx = mg.zeros("link")
+                Ky = mg.zeros("link")
+                Kx[self._hoz] = kd_links[self._hoz]
+                Ky[self._vert] = kd_links[self._vert]
+                vert_link_crosslink_K = np.ma.array(
+                    kd_links[self._vert_link_neighbors],
+                    mask=self._vert_link_badlinks,
+                )
+                hoz_link_crosslink_K = np.ma.array(
+                    kd_links[self._hoz_link_neighbors], mask=self._hoz_link_badlinks
+                )
+                Kx[self._vert] = vert_link_crosslink_K.mean(axis=1)
+                Ky[self._hoz] = hoz_link_crosslink_K.mean(axis=1)
+                Cslope = np.sqrt(slx**2 + sly**2)
+                v = np.sqrt(Kx**2 + Ky**2)
+                flux_links = v * Cslope
+                # NEW, to resolve issue with K being off angle to S:
+                # in fact, no. Doing this just makes this equivalent
+                # to the basic diffuser, but with a bunch more crap
+                # involved.
+                # flux_x = slx * Kx
+                # flux_y = sly * Ky
+                # flux_links = np.sqrt(flux_x*flux_x + flux_y*flux_y)
+                theta = np.arctan(np.fabs(sly) / (np.fabs(slx) + 1.0e-10))
+                flux_links[self._hoz] *= np.sign(slx[self._hoz]) * np.cos(
+                    theta[self._hoz]
+                )
+                flux_links[self._vert] *= np.sign(sly[self._vert]) * np.sin(
+                    theta[self._vert]
+                )
+                # zero out the inactive links
+                self._qs[mg.active_links] = -flux_links[mg.active_links]
+
+                self._grid.calc_flux_div_at_node(self._qs, out=self._dqsds)
+
+        else:  # ..._use_diags
+            # NB: this is dirty code. It uses the obsolete diagonal data
+            # structures, and necessarily has to do a bunch of mapping
+            # on the fly.
+
+            # remap the kds onto the links, as necessary
+            if isinstance(self._kd, np.ndarray):
+                d8link_kd = np.empty(self._grid.number_of_d8, dtype=float)
+                d8link_kd[self._grid.active_links] = kd_activelinks
+                d8link_kd[self._grid.active_diagonals] = np.amax(
+                    self._kd[self._grid.nodes_at_diagonal[self._grid.active_diagonals]],
+                    axis=1,
+                ).flatten()
+            else:
+                d8link_kd = self._kd
+            self._g[self._grid.active_links] = self._grid.calc_grad_at_link(z)[
+                self._grid.active_links
+            ]
+            self._g[self._grid.active_diagonals] = (
+                z[self._grid._diag_activelink_tonode]
+                - z[self._grid._diag_activelink_fromnode]
+            ) / self._grid.length_of_d8[self._grid.active_diagonals]
+            self._qs[:] = -d8link_kd * self._g
+
+            total_flux = self._qs * self._d8width_face_at_link  # nlinks
+            totalflux_allnodes = (
+                total_flux[self._grid.links_at_node]
+                * self._grid.active_link_dirs_at_node
+            ).sum(axis=1)
+            totalflux_allnodes += (
+                total_flux[self._grid.d8s_at_node[:, 4:]]
+                * self._grid.active_diagonal_dirs_at_node
+            ).sum(axis=1)
+            self._dqsds[self._grid.node_at_cell] = (
+                -totalflux_allnodes[self._grid.node_at_cell] / self._grid.area_of_cell
+            )
+
+    def ode_step(self, dt):
         # Take the smaller of delt or built-in time-step size self._dt
         self._tstep_ratio = dt / self._dt
         repeats = int(self._tstep_ratio // 1.0)
         extra_time = self._tstep_ratio - repeats
+
+        core_nodes = self._grid.node_at_core_cell
 
         # Can really get into trouble if no diffusivity happens but we run...
         if self._dt < np.inf:
             loops = repeats + 1
         else:
             loops = 0
+
         for i in range(loops):
-            if not self._use_diags:
-                grads = mg.calc_grad_at_link(z)
-                self._g[mg.active_links] = grads[mg.active_links]
-                if not self._use_patches:  # currently forbidden
-                    # if diffusivity is an array, self._kd is already
-                    # active_links-long
-                    self._qs[mg.active_links] = (
-                        -kd_activelinks * self._g[mg.active_links]
-                    )
-                    # Calculate the net deposition/erosion rate at each node
-                    mg.calc_flux_div_at_node(self._qs, out=self._dqsds)
-                else:  # project onto patches
-                    slx = mg.zeros("link")
-                    sly = mg.zeros("link")
-                    slx[self._hoz] = self._g[self._hoz]
-                    sly[self._vert] = self._g[self._vert]
-                    patch_dx, patch_dy = mg.calc_grad_at_patch(z)
-                    xvecs_vert = np.ma.array(
-                        patch_dx[self._y_link_patches], mask=self._y_link_patch_mask
-                    )
-                    slx[self._vert] = xvecs_vert.mean()
-                    yvecs_hoz = np.ma.array(
-                        patch_dy[self._x_link_patches], mask=self._x_link_patch_mask
-                    )
-                    sly[self._hoz] = yvecs_hoz.mean()
-                    # now map diffusivities (already on links, but we want
-                    # more spatial averaging)
-                    Kx = mg.zeros("link")
-                    Ky = mg.zeros("link")
-                    Kx[self._hoz] = kd_links[self._hoz]
-                    Ky[self._vert] = kd_links[self._vert]
-                    vert_link_crosslink_K = np.ma.array(
-                        kd_links[self._vert_link_neighbors],
-                        mask=self._vert_link_badlinks,
-                    )
-                    hoz_link_crosslink_K = np.ma.array(
-                        kd_links[self._hoz_link_neighbors], mask=self._hoz_link_badlinks
-                    )
-                    Kx[self._vert] = vert_link_crosslink_K.mean(axis=1)
-                    Ky[self._hoz] = hoz_link_crosslink_K.mean(axis=1)
-                    Cslope = np.sqrt(slx**2 + sly**2)
-                    v = np.sqrt(Kx**2 + Ky**2)
-                    flux_links = v * Cslope
-                    # NEW, to resolve issue with K being off angle to S:
-                    # in fact, no. Doing this just makes this equivalent
-                    # to the basic diffuser, but with a bunch more crap
-                    # involved.
-                    # flux_x = slx * Kx
-                    # flux_y = sly * Ky
-                    # flux_links = np.sqrt(flux_x*flux_x + flux_y*flux_y)
-                    theta = np.arctan(np.fabs(sly) / (np.fabs(slx) + 1.0e-10))
-                    flux_links[self._hoz] *= np.sign(slx[self._hoz]) * np.cos(
-                        theta[self._hoz]
-                    )
-                    flux_links[self._vert] *= np.sign(sly[self._vert]) * np.sin(
-                        theta[self._vert]
-                    )
-                    # zero out the inactive links
-                    self._qs[mg.active_links] = -flux_links[mg.active_links]
-
-                    self._grid.calc_flux_div_at_node(self._qs, out=self._dqsds)
-
-            else:  # ..._use_diags
-                # NB: this is dirty code. It uses the obsolete diagonal data
-                # structures, and necessarily has to do a bunch of mapping
-                # on the fly.
-
-                # remap the kds onto the links, as necessary
-                if isinstance(self._kd, np.ndarray):
-                    d8link_kd = np.empty(self._grid.number_of_d8, dtype=float)
-                    d8link_kd[self._grid.active_links] = kd_activelinks
-                    d8link_kd[self._grid.active_diagonals] = np.amax(
-                        self._kd[
-                            self._grid.nodes_at_diagonal[self._grid.active_diagonals]
-                        ],
-                        axis=1,
-                    ).flatten()
-                else:
-                    d8link_kd = self._kd
-                self._g[self._grid.active_links] = self._grid.calc_grad_at_link(z)[
-                    self._grid.active_links
-                ]
-                self._g[self._grid.active_diagonals] = (
-                    z[self._grid._diag_activelink_tonode]
-                    - z[self._grid._diag_activelink_fromnode]
-                ) / self._grid.length_of_d8[self._grid.active_diagonals]
-                self._qs[:] = -d8link_kd * self._g
-
-                total_flux = self._qs * self._d8width_face_at_link  # nlinks
-                totalflux_allnodes = (
-                    total_flux[self._grid.links_at_node]
-                    * self._grid.active_link_dirs_at_node
-                ).sum(axis=1)
-                totalflux_allnodes += (
-                    total_flux[self._grid.d8s_at_node[:, 4:]]
-                    * self._grid.active_diagonal_dirs_at_node
-                ).sum(axis=1)
-                self._dqsds[self._grid.node_at_cell] = (
-                    -totalflux_allnodes[self._grid.node_at_cell]
-                    / self._grid.area_of_cell
-                )
-
             # Calculate the total rate of elevation change
             dzdt = -self._dqsds
             if not self._deposit:
@@ -587,6 +574,22 @@ class LinearDiffuser(Component):
             vals[self._fixed_grad_nodes] = (
                 vals[self._fixed_grad_anchors] + self._fixed_grad_offsets
             )
+
+    def run_one_step(self, dt):
+        """Run the diffuser for one timestep, dt.
+
+        If the imposed timestep dt is longer than the Courant-Friedrichs-Lewy
+        condition for the diffusion, this timestep will be internally divided
+        as the component runs, as needed.
+
+        Parameters
+        ----------
+        dt : float (time)
+            The imposed timestep.
+        """
+
+        self.discretize_rhs()
+        self.ode_step(dt)
 
     @property
     def time_step(self):
